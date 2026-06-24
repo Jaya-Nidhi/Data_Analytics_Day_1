@@ -1,0 +1,7 @@
+scheme_code,label,status,scheme_name,fund_house,n_records,output_file
+125497,hdfc_top_100_direct,WARNING: name mismatch,SBI Small Cap Fund - Direct Plan - Growth,SBI Mutual Fund,3107,data/raw\nav_hdfc_top_100_direct_125497.csv
+119551,sbi_bluechip,WARNING: name mismatch,Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - IDCW,Aditya Birla Sun Life Mutual Fund,3252,data/raw\nav_sbi_bluechip_119551.csv
+120503,icici_bluechip,WARNING: name mismatch,Axis ELSS Tax Saver Fund - Direct Plan - Growth Option,Axis Mutual Fund,3323,data/raw\nav_icici_bluechip_120503.csv
+118632,nippon_large_cap,ok,Nippon India Large Cap Fund - Direct Plan Growth Plan - Growth Option,Nippon India Mutual Fund,3314,data/raw\nav_nippon_large_cap_118632.csv
+119092,axis_bluechip,WARNING: name mismatch,HDFC Money Market Fund - Growth Option - Direct Plan,HDFC Mutual Fund,3581,data/raw\nav_axis_bluechip_119092.csv
+120841,kotak_bluechip,WARNING: name mismatch,quant Mid Cap Fund - Growth Option - Direct Plan,quant Mutual Fund,3317,data/raw\nav_kotak_bluechip_120841.csv
