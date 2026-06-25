@@ -7,6 +7,8 @@
 
 PRAGMA foreign_keys = ON;
 
+DROP TABLE IF EXISTS fact_benchmark_prices;
+DROP TABLE IF EXISTS fact_portfolio_holdings;
 DROP TABLE IF EXISTS fact_aum;
 DROP TABLE IF EXISTS fact_performance;
 DROP TABLE IF EXISTS fact_transactions;
@@ -112,9 +114,39 @@ CREATE TABLE fact_aum (
 );
 
 -- ---------------------------------------------------------------------
+-- Fact: portfolio holdings snapshot (stocks held by each fund)
+-- ---------------------------------------------------------------------
+CREATE TABLE fact_portfolio_holdings (
+    holding_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    amfi_code          INTEGER NOT NULL,
+    date_id            INTEGER NOT NULL,
+    stock_symbol       TEXT NOT NULL,
+    stock_name         TEXT,
+    sector             TEXT,
+    weight_pct         REAL,
+    market_value_cr    REAL,
+    current_price_inr  REAL,
+    FOREIGN KEY (amfi_code) REFERENCES dim_fund(amfi_code),
+    FOREIGN KEY (date_id)   REFERENCES dim_date(date_id)
+);
+
+-- ---------------------------------------------------------------------
+-- Fact: benchmark index daily closing prices
+-- ---------------------------------------------------------------------
+CREATE TABLE fact_benchmark_prices (
+    benchmark_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    date_id       INTEGER NOT NULL,
+    index_name    TEXT NOT NULL,
+    close_value   REAL NOT NULL,
+    FOREIGN KEY (date_id) REFERENCES dim_date(date_id)
+);
+
+-- ---------------------------------------------------------------------
 -- Indexes to speed up the common fund+date join pattern
 -- ---------------------------------------------------------------------
-CREATE INDEX idx_fact_nav_fund_date  ON fact_nav(amfi_code, date_id);
-CREATE INDEX idx_fact_txn_fund_date  ON fact_transactions(amfi_code, date_id);
-CREATE INDEX idx_fact_perf_fund_date ON fact_performance(amfi_code, date_id);
-CREATE INDEX idx_fact_aum_fund_date  ON fact_aum(amfi_code, date_id);
+CREATE INDEX idx_fact_nav_fund_date     ON fact_nav(amfi_code, date_id);
+CREATE INDEX idx_fact_txn_fund_date     ON fact_transactions(amfi_code, date_id);
+CREATE INDEX idx_fact_perf_fund_date    ON fact_performance(amfi_code, date_id);
+CREATE INDEX idx_fact_aum_fund_date     ON fact_aum(amfi_code, date_id);
+CREATE INDEX idx_fact_hold_fund_date    ON fact_portfolio_holdings(amfi_code, date_id);
+CREATE INDEX idx_fact_bench_date_index  ON fact_benchmark_prices(date_id, index_name);

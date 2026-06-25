@@ -53,7 +53,14 @@ def build_dim_date(all_dates):
 
 
 def to_date_id(series):
-    return pd.to_datetime(series, errors="coerce").dt.strftime("%Y%m%d").astype("Int64")
+    # Use ISO8601 format first to avoid the pandas 3.x dayfirst corruption bug
+    # (dayfirst=True silently swaps month/day for DD<=12 on YYYY-MM-DD strings).
+    parsed = pd.to_datetime(series, errors="coerce", format="ISO8601")
+    # Retry any genuinely non-ISO values without dayfirst
+    unparsed = parsed.isna() & pd.Series(series).notna()
+    if unparsed.any():
+        parsed[unparsed] = pd.to_datetime(series[unparsed], errors="coerce", dayfirst=False)
+    return parsed.dt.strftime("%Y%m%d").astype("Int64")
 
 
 def main():
@@ -105,6 +112,11 @@ def main():
     if master_df is not None:
         code_col = find_col(master_df, ["amfi_code", "scheme_code"])
         dim_fund = master_df.rename(columns={code_col: "amfi_code"})
+        # fund_master.csv uses 'risk_category'; the schema column is 'risk_grade'.
+        # Rename so the data actually lands in the DB instead of being silently dropped.
+        risk_col = find_col(dim_fund, ["risk_category", "risk_grade"])
+        if risk_col and risk_col != "risk_grade":
+            dim_fund = dim_fund.rename(columns={risk_col: "risk_grade"})
         keep = [c for c in
                 ["amfi_code", "fund_house", "scheme_name", "category", "sub_category", "risk_grade"]
                 if c in dim_fund.columns]
@@ -129,6 +141,17 @@ def main():
     if txn_df is not None:
         code_col = find_col(txn_df, ["amfi_code", "scheme_code"])
         fact_txn = txn_df.rename(columns={code_col: "amfi_code"}).copy()
+
+        # The raw CSV uses 'transaction_date' and 'amount_inr'; data_cleaning.py renames
+        # these to 'date' and 'amount'. Handle both so this works whether or not
+        # data_cleaning was run first.
+        date_col = find_col(fact_txn, ["date", "transaction_date", "txn_date"])
+        if date_col and date_col != "date":
+            fact_txn = fact_txn.rename(columns={date_col: "date"})
+        amount_col = find_col(fact_txn, ["amount", "amount_inr", "transaction_amount", "amt"])
+        if amount_col and amount_col != "amount":
+            fact_txn = fact_txn.rename(columns={amount_col: "amount"})
+
         if "date" in fact_txn.columns:
             fact_txn["date_id"] = to_date_id(fact_txn["date"])
         keep = [c for c in
@@ -137,7 +160,23 @@ def main():
                 if c in fact_txn.columns]
         fact_txn = fact_txn[keep]
         if "date_id" in fact_txn.columns:
-            fact_txn = fact_txn.dropna(subset=["date_id"])
+            # Instead of silently dropping rows whose date couldn't be parsed, use a
+            # sentinel date_id of 19000101 so the row is preserved and queryable.
+            # A missing transaction date is a data-quality issue, not a reason to lose the record.
+            SENTINEL_DATE_ID = 19000101
+            null_date_mask = fact_txn["date_id"].isna()
+            n_null_dates = int(null_date_mask.sum())
+            if n_null_dates:
+                print(f"  WARNING: {n_null_dates} transaction rows have an unparseable date -- "
+                      f"assigned sentinel date_id {SENTINEL_DATE_ID} so the rows are preserved.")
+                fact_txn["date_id"] = fact_txn["date_id"].fillna(SENTINEL_DATE_ID).astype(int)
+                # Ensure the sentinel date exists in dim_date
+                sentinel_row = pd.DataFrame([{
+                    "date_id": SENTINEL_DATE_ID, "full_date": "1900-01-01",
+                    "year": 1900, "quarter": 1, "month": 1, "month_name": "January",
+                    "day": 1, "day_of_week": "Monday", "is_weekend": 0,
+                }])
+                sentinel_row.to_sql("dim_date", engine, if_exists="append", index=False)
         fact_txn.to_sql("fact_transactions", engine, if_exists="append", index=False)
     else:
         print("No investor_transactions CSV found -- fact_transactions left empty.")
@@ -155,19 +194,18 @@ def main():
         else:
             perf["date_id"] = int(SNAPSHOT_DATE.strftime("%Y%m%d"))
 
-        # Only rename columns that actually start with "return" -- matching on
-        # a bare "1y"/"3y"/"5y" substring is too loose and can catch unrelated
-        # columns like "benchmark_3yr_pct", which would collide with return_3y.
+        # Rename return_*yr_pct / return_*y to the canonical schema names.
+        # Handles both '1yr' (return_1yr_pct) and '1y' (return_1y) style suffixes.
         rename_returns = {}
         for c in perf.columns:
             cl = c.lower()
             if not cl.startswith("return"):
                 continue
-            if "1y" in cl:
+            if "1yr" in cl or ("1y" in cl and "1yr" not in cl):
                 rename_returns[c] = "return_1y"
-            elif "3y" in cl:
+            elif "3yr" in cl or ("3y" in cl and "3yr" not in cl):
                 rename_returns[c] = "return_3y"
-            elif "5y" in cl:
+            elif "5yr" in cl or ("5y" in cl and "5yr" not in cl):
                 rename_returns[c] = "return_5y"
         perf = perf.rename(columns=rename_returns)
 
@@ -175,7 +213,7 @@ def main():
         DESCRIPTIVE_COLS = {"scheme_name", "fund_house", "category", "sub_category",
                              "plan", "risk_grade"}
 
-        aum_col = find_col(perf, ["aum", "aum_cr", "aum_crore"])
+        aum_col = find_col(perf, ["aum_cr", "aum_crore", "aum"])
 
         # Known performance/risk metric columns we have a schema.sql slot for.
         # If your real file has even more metric columns, add the column name
@@ -207,6 +245,52 @@ def main():
             print("No AUM column found in scheme_performance -- fact_aum left empty.")
     else:
         print("No scheme_performance CSV found -- fact_performance/fact_aum left empty.")
+
+    # ---- fact_portfolio_holdings ----
+    holdings_df = load_csv_if_exists(["portfolio_holdings", "holdings"])
+    if holdings_df is not None:
+        holdings_df["date_id"] = to_date_id(holdings_df.get("portfolio_date",
+                                             holdings_df.get("date", None)))
+        # Ensure all portfolio dates exist in dim_date
+        extra_dates = build_dim_date(
+            pd.to_datetime(holdings_df.get("portfolio_date",
+                           holdings_df.get("date")), errors="coerce").dropna().unique()
+        )
+        extra_dates = extra_dates[~extra_dates["date_id"].isin(
+            pd.read_sql("SELECT date_id FROM dim_date", engine)["date_id"]
+        )]
+        if not extra_dates.empty:
+            extra_dates.to_sql("dim_date", engine, if_exists="append", index=False)
+
+        hold_keep = [c for c in
+                     ["amfi_code", "date_id", "stock_symbol", "stock_name",
+                      "sector", "weight_pct", "market_value_cr", "current_price_inr"]
+                     if c in holdings_df.columns]
+        holdings_df[hold_keep].dropna(subset=["date_id"]).to_sql(
+            "fact_portfolio_holdings", engine, if_exists="append", index=False)
+        print(f"  fact_portfolio_holdings: loaded {len(holdings_df)} rows")
+    else:
+        print("No portfolio_holdings CSV found -- fact_portfolio_holdings left empty.")
+
+    # ---- dim_benchmark / fact_benchmark_prices ----
+    bench_df = load_csv_if_exists(["benchmark_indices", "benchmark"])
+    if bench_df is not None:
+        bench_df["date_id"] = to_date_id(bench_df["date"])
+        # Add any benchmark dates missing from dim_date
+        extra_dates = build_dim_date(
+            pd.to_datetime(bench_df["date"], errors="coerce").dropna().unique()
+        )
+        extra_dates = extra_dates[~extra_dates["date_id"].isin(
+            pd.read_sql("SELECT date_id FROM dim_date", engine)["date_id"]
+        )]
+        if not extra_dates.empty:
+            extra_dates.to_sql("dim_date", engine, if_exists="append", index=False)
+
+        bench_df.drop(columns=["date"], errors="ignore").dropna(subset=["date_id"]).to_sql(
+            "fact_benchmark_prices", engine, if_exists="append", index=False)
+        print(f"  fact_benchmark_prices: loaded {len(bench_df)} rows")
+    else:
+        print("No benchmark_indices CSV found -- fact_benchmark_prices left empty.")
 
     # ---- verification: cleaned (processed) CSV rows vs rows actually loaded ----
     print("\nRow count verification (cleaned CSV rows -> rows loaded into fact table):")

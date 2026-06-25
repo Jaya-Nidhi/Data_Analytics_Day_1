@@ -65,7 +65,27 @@ def find_col(df, candidates):
 
 
 def parse_dates(series):
-    return pd.to_datetime(series, errors="coerce", dayfirst=True)
+    """Parse a date series safely.
+
+    pandas 3.x with dayfirst=True on ISO-format (YYYY-MM-DD) strings has two
+    bugs simultaneously:
+      - Dates where DD <= 12: silently swaps day and month (data corruption!)
+        e.g. '2024-01-12' becomes 2024-12-01 instead of 2024-01-12
+      - Dates where DD > 12: returns NaT because the swapped month > 12 is invalid
+
+    Fix: try ISO8601 format first (handles all YYYY-MM-DD data correctly and fast).
+    Fall back to mixed inference WITHOUT dayfirst for any remaining unparseable
+    values, so genuine DD/MM/YYYY or ambiguous dates still get a best-effort parse.
+    """
+    # Fast path: ISO8601 covers the overwhelming majority of dates in this project
+    result = pd.to_datetime(series, errors="coerce", format="ISO8601")
+    # If some values didn't parse (e.g. genuine DD-MM-YYYY entries), retry those
+    unparsed_mask = result.isna() & series.notna()
+    if unparsed_mask.any():
+        fallback = pd.to_datetime(series[unparsed_mask], errors="coerce", dayfirst=False)
+        result = result.copy()
+        result[unparsed_mask] = fallback
+    return result
 
 
 def generic_clean(df):
@@ -202,7 +222,9 @@ def clean_investor_transactions(df):
 
 def clean_scheme_performance(df):
     code_col = find_col(df, ["amfi_code", "scheme_code"])
-    expense_col = find_col(df, ["expense_ratio", "ter", "expense_ratio_pct"])
+    # expense_ratio_pct is the actual column name in the source CSV; 'expense_ratio' /
+    # 'ter' are kept as fallbacks for other possible source layouts.
+    expense_col = find_col(df, ["expense_ratio_pct", "expense_ratio", "ter"])
 
     rename_map = {}
     if code_col:
@@ -213,8 +235,10 @@ def clean_scheme_performance(df):
 
     before = len(df)
 
+    # Match both '1y' and '1yr' style suffixes (e.g. return_1yr_pct, return_1y)
     return_cols = [c for c in df.columns
-                   if "return" in c.lower() or any(tag in c.lower() for tag in ("1y", "3y", "5y"))]
+                   if "return" in c.lower()
+                   or any(tag in c.lower() for tag in ("1yr", "3yr", "5yr", "1y", "3y", "5y"))]
     n_non_numeric = 0
     for c in return_cols:
         coerced = pd.to_numeric(df[c], errors="coerce")
@@ -224,7 +248,9 @@ def clean_scheme_performance(df):
     n_out_of_range = 0
     if "expense_ratio" in df.columns:
         df["expense_ratio"] = pd.to_numeric(df["expense_ratio"], errors="coerce")
-        out_of_range = ~df["expense_ratio"].between(0.1, 2.5)
+        # SEBI caps equity TER at 2.25% and debt at 2.00%; 0.05% is a realistic floor
+        # for ultra-low-cost index funds. Flag anything outside that band as suspicious.
+        out_of_range = ~df["expense_ratio"].between(0.05, 2.5)
         n_out_of_range = int(out_of_range.sum())
         if n_out_of_range:
             print(f"  WARNING: {n_out_of_range} rows have expense_ratio outside the "
@@ -253,10 +279,104 @@ def clean_scheme_performance(df):
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# portfolio_holdings.csv
+# ---------------------------------------------------------------------------
+
+def clean_portfolio_holdings(df):
+    code_col = find_col(df, ["amfi_code", "scheme_code"])
+    date_col = find_col(df, ["portfolio_date", "date"])
+    weight_col = find_col(df, ["weight_pct", "weight"])
+    mv_col = find_col(df, ["market_value_cr", "market_value", "mv_cr"])
+    price_col = find_col(df, ["current_price_inr", "current_price", "price"])
+
+    rename_map = {}
+    for col, new in [(code_col, "amfi_code"), (date_col, "portfolio_date"),
+                     (weight_col, "weight_pct"), (mv_col, "market_value_cr"),
+                     (price_col, "current_price_inr")]:
+        if col:
+            rename_map[col] = new
+    df = df.rename(columns=rename_map)
+
+    before = len(df)
+
+    if "portfolio_date" in df.columns:
+        df["portfolio_date"] = parse_dates(df["portfolio_date"])
+
+    # Weight must be a positive percentage
+    n_bad_weight = 0
+    if "weight_pct" in df.columns:
+        df["weight_pct"] = pd.to_numeric(df["weight_pct"], errors="coerce")
+        bad = df["weight_pct"].isna() | (df["weight_pct"] <= 0)
+        n_bad_weight = int(bad.sum())
+        df = df[~bad]
+
+    # Sanity-check: per fund weights should sum to ~100%; warn if any fund is off
+    if "amfi_code" in df.columns and "weight_pct" in df.columns:
+        sums = df.groupby("amfi_code")["weight_pct"].sum()
+        off = sums[(sums < 95) | (sums > 105)]
+        if not off.empty:
+            print(f"  WARNING: {len(off)} fund(s) have portfolio weights outside 95-105% range: "
+                  f"{off.to_dict()}")
+
+    for col in ["market_value_cr", "current_price_inr"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    before_dedupe = len(df)
+    df = df.drop_duplicates()
+    n_dupes = before_dedupe - len(df)
+
+    print(f"  portfolio_holdings: {before} -> {len(df)} rows "
+          f"(removed {n_bad_weight} rows with invalid weight, {n_dupes} duplicate rows)")
+    return df.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# benchmark_indices.csv
+# ---------------------------------------------------------------------------
+
+def clean_benchmark_indices(df):
+    date_col = find_col(df, ["date", "index_date"])
+    index_col = find_col(df, ["index_name", "index", "benchmark"])
+    value_col = find_col(df, ["close_value", "close", "value", "closing_value"])
+
+    rename_map = {}
+    for col, new in [(date_col, "date"), (index_col, "index_name"), (value_col, "close_value")]:
+        if col:
+            rename_map[col] = new
+    df = df.rename(columns=rename_map)
+
+    if not all(c in df.columns for c in ["date", "index_name", "close_value"]):
+        raise ValueError(
+            f"benchmark_indices.csv missing expected columns. Found: {list(df.columns)}"
+        )
+
+    before = len(df)
+    df["date"] = parse_dates(df["date"])
+    df["close_value"] = pd.to_numeric(df["close_value"], errors="coerce")
+
+    # Drop non-positive close values
+    bad = df["close_value"].isna() | (df["close_value"] <= 0)
+    n_bad = int(bad.sum())
+    df = df[~bad]
+
+    # Drop duplicate (date, index_name) rows
+    dup_mask = df.duplicated(subset=["date", "index_name"], keep="first")
+    n_dupes = int(dup_mask.sum())
+    df = df[~dup_mask]
+
+    print(f"  benchmark_indices: {before} -> {len(df)} rows "
+          f"(removed {n_bad} invalid close values, {n_dupes} duplicate date+index rows)")
+    return df.sort_values(["index_name", "date"]).reset_index(drop=True)
+
+
 HANDLERS = [
     (["nav_history", "nav history"], clean_nav_history),
     (["investor_transactions", "transactions"], clean_investor_transactions),
     (["scheme_performance", "performance"], clean_scheme_performance),
+    (["portfolio_holdings", "holdings"], clean_portfolio_holdings),
+    (["benchmark_indices", "benchmark"], clean_benchmark_indices),
 ]
 
 

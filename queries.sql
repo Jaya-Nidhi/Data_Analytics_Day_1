@@ -89,3 +89,37 @@ SELECT f.scheme_name, f.fund_house
 FROM dim_fund f
 LEFT JOIN fact_transactions t ON t.amfi_code = f.amfi_code
 WHERE t.transaction_id IS NULL;
+
+-- 11. Top sectors by total portfolio weight across all funds (most recent snapshot)
+SELECT h.sector,
+       ROUND(AVG(h.weight_pct), 2) AS avg_weight_pct,
+       COUNT(DISTINCT h.amfi_code)  AS num_funds_holding
+FROM fact_portfolio_holdings h
+WHERE h.date_id = (SELECT MAX(date_id) FROM fact_portfolio_holdings)
+GROUP BY h.sector
+ORDER BY avg_weight_pct DESC;
+
+-- 12. NAV of a fund vs its benchmark index over time (e.g. SBI Bluechip vs NIFTY100)
+SELECT d.full_date,
+       n.nav,
+       b.close_value  AS benchmark_close,
+       ROUND(100.0 * n.nav / FIRST_VALUE(n.nav) OVER (ORDER BY d.full_date) - 100, 2)
+           AS nav_return_pct,
+       ROUND(100.0 * b.close_value / FIRST_VALUE(b.close_value) OVER (ORDER BY d.full_date) - 100, 2)
+           AS bench_return_pct
+FROM fact_nav n
+JOIN dim_date d           ON d.date_id   = n.date_id
+JOIN fact_benchmark_prices b ON b.date_id = n.date_id AND b.index_name = 'NIFTY100'
+WHERE n.amfi_code = 119551   -- SBI Bluechip Regular; change as needed
+ORDER BY d.full_date;
+
+-- 13. Most widely held stocks across all funds (portfolio concentration check)
+SELECT h.stock_symbol, h.stock_name,
+       COUNT(DISTINCT h.amfi_code)        AS held_by_n_funds,
+       ROUND(AVG(h.weight_pct), 2)        AS avg_weight_pct,
+       ROUND(SUM(h.market_value_cr), 2)   AS total_market_value_cr
+FROM fact_portfolio_holdings h
+WHERE h.date_id = (SELECT MAX(date_id) FROM fact_portfolio_holdings)
+GROUP BY h.stock_symbol, h.stock_name
+ORDER BY held_by_n_funds DESC, total_market_value_cr DESC
+LIMIT 20;
